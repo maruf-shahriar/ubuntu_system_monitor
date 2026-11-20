@@ -178,11 +178,29 @@ def pick_temp(rows, chip, labels=None):
     return None
 
 
+def cpu_packages(rows):
+    """One temperature per CPU socket (servers can have two or more)."""
+    out, seen = [], set()
+    for chip, labels in (("coretemp", None), ("k10temp", ("Tdie", "Tctl")),
+                         ("zenpower", ("Tdie", "Tctl"))):
+        for r in rows:
+            if r["chip"] != chip or r["dev"] in seen:
+                continue
+            if r["label"] in labels if labels else r["label"].startswith("Package id"):
+                seen.add(r["dev"])
+                out.append({"name": f"CPU{len(out)}", "temp": r["temp"],
+                            "core_temps": [x["temp"] for x in rows if x["dev"] == r["dev"]
+                                           and x["label"].startswith("Core")]})
+        if out:
+            break
+    return out
+
+
 def cpu_temp(rows):
+    packages = cpu_packages(rows)
+    if packages:
+        return max(p["temp"] for p in packages)
     for chip, labels in (
-        ("coretemp", {"Package id 0"}),
-        ("k10temp", {"Tctl", "Tdie"}),
-        ("zenpower", {"Tdie", "Tctl"}),
         ("thinkpad", {"CPU"}),
         ("cpu_thermal", None),
         ("acpitz", None),
@@ -376,8 +394,7 @@ def collect(sample=0.5, top_n=5):
             "percent": total,
             "per_core": per_core,
             "temp": cpu_temp(rows),
-            "core_temps": [r["temp"] for r in rows
-                           if r["chip"] == "coretemp" and r["label"].startswith("Core")],
+            "packages": cpu_packages(rows),
         },
         "ram": {"used": vm.total - vm.available, "total": vm.total, "percent": vm.percent},
         "swap": {"used": sw.used, "total": sw.total, "percent": sw.percent},
@@ -397,8 +414,10 @@ def collect(sample=0.5, top_n=5):
 def find_warnings(d, th):
     w = []
     c = d["cpu"]
-    if c["temp"] is not None and c["temp"] >= th["cpu_temp"]:
-        w.append(f"CPU temperature {c['temp']:.0f}°C")
+    sockets = c["packages"] if len(c["packages"]) > 1 else [{"name": "CPU", "temp": c["temp"]}]
+    for s in sockets:
+        if s["temp"] is not None and s["temp"] >= th["cpu_temp"]:
+            w.append(f"{s['name']} temperature {s['temp']:.0f}°C")
     if c["percent"] >= th["cpu_percent"]:
         w.append(f"CPU usage {c['percent']:.0f}%")
     if d["ram"]["percent"] >= th["ram_percent"]:
@@ -428,6 +447,15 @@ class Paint:
         if value is None:
             return text
         return self(text, "31;1" if value >= crit else "33" if value >= warn else "32")
+
+
+def spread(values, fmt, p, limit=16):
+    """List a few values in full; summarise long lists (big servers) as min/avg/max."""
+    if len(values) <= limit:
+        return " ".join(fmt(v) for v in values)
+    avg = sum(values) / len(values)
+    return (f"min {fmt(min(values))} · avg {fmt(avg)} · max {fmt(max(values))}"
+            + p(f"  ({len(values)} values)", "90"))
 
 
 def render(d, color=True, bar_width=24, compact=False, th=None):
@@ -460,11 +488,14 @@ def render(d, color=True, bar_width=24, compact=False, th=None):
     if not compact:
         row("CPU", p(f"{c['model']} · {c['cores']}C/{c['threads']}T{freq}", "90"))
         row("", f"{bar(c['percent'])} {c['percent']:5.1f}%  {temp(c['temp'], 70, th['cpu_temp'])}")
-        cores = " ".join(p.level(f"{x:3.0f}", x, 60, 85) for x in c["per_core"])
-        row("", p("threads %:", "90") + " " + cores)
-        if c["core_temps"]:
-            row("", p("cores °C: ", "90") + " " + " ".join(
-                p.level(f"{t:3.0f}", t, 70, th["cpu_temp"]) for t in c["core_temps"]))
+        row("", p("threads %:", "90") + " " + spread(
+            c["per_core"], lambda x: p.level(f"{x:3.0f}", x, 60, 85), p))
+        multi = len(c["packages"]) > 1
+        for pk in c["packages"]:
+            if pk["core_temps"]:
+                name = f"{pk['name']} °C:" if multi else "cores °C:"
+                row("", p(f"{name:<10}", "90") + " " + spread(
+                    pk["core_temps"], lambda t: p.level(f"{t:3.0f}", t, 70, th["cpu_temp"]), p))
     else:
         row("CPU", f"{bar(c['percent'])} {c['percent']:5.1f}%")
 
@@ -489,8 +520,10 @@ def render(d, color=True, bar_width=24, compact=False, th=None):
 
     lines.append("")
     lines.append(p("Temperatures", "1;36"))
-    lines.append(f"  {'CPU':<5}{temp(c['temp'], 70, th['cpu_temp'])}" +
-                 ("" if compact else p(f"  {c['model']}", "90")))
+    sockets = c["packages"] if len(c["packages"]) > 1 else [{"name": "CPU", "temp": c["temp"]}]
+    for i, s in enumerate(sockets):
+        model = "" if compact or i else p(f"  {c['model']}", "90")
+        lines.append(f"  {s['name']:<5}{temp(s['temp'], 70, th['cpu_temp'])}{model}")
     if d["gpus"]:
         for g in d["gpus"]:
             extra = ""
