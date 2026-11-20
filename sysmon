@@ -40,6 +40,9 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 UNIT_DIR = XDG_CONFIG / "systemd" / "user"
 SERVICE_NAME = f"{APP}.service"
 TIMER_NAME = f"{APP}.timer"
+# Written once a minute by the root timer from install-ipmi.sh.
+IPMI_FILE = Path(os.environ.get("SYSMON_IPMI_FILE", "/run/sysmon/ipmi.txt"))
+IPMI_STALE_SECS = 600
 
 DEFAULT_CONFIG = {
     "bot_token": "",
@@ -53,6 +56,8 @@ DEFAULT_CONFIG = {
         "cpu_temp": 85,
         "gpu_temp": 85,
         "ssd_temp": 70,
+        "inlet_temp": 35,     # servers (IPMI): air coming into the chassis
+        "exhaust_temp": 60,   # servers (IPMI): air leaving the chassis
     },
 }
 
@@ -326,6 +331,52 @@ def disks():
     return out
 
 
+def machine_model():
+    vendor = read("/sys/class/dmi/id/sys_vendor") or ""
+    product = read("/sys/class/dmi/id/product_name") or ""
+    return " ".join(x for x in (vendor.replace(" Inc.", ""), product) if x) or None
+
+
+def ipmi_sensors():
+    """Server sensors saved by the root timer from install-ipmi.sh, or None.
+
+    The file is `ipmitool sdr elist` output: name | id | status | entity | reading.
+    """
+    try:
+        age = time.time() - IPMI_FILE.stat().st_mtime
+        text = IPMI_FILE.read_text()
+    except OSError:
+        return None
+    out = {"age": age, "inlet": None, "exhaust": None, "power_w": None,
+           "fans": [], "fan_redundancy": None, "psus": [], "problems": []}
+    for line in text.splitlines():
+        parts = [x.strip() for x in line.split("|")]
+        if len(parts) != 5:
+            continue
+        name, _id, status, entity, reading = parts
+        low = name.lower()
+        m = re.match(r"(-?[\d.]+) (degrees C|RPM|Watts)$", reading)
+        value, unit = (float(m.group(1)), m.group(2)) if m else (None, None)
+        if unit == "degrees C":
+            if ("inlet" in low or "ambient" in low) and out["inlet"] is None:
+                out["inlet"] = value
+            elif ("exhaust" in low or "outlet" in low) and out["exhaust"] is None:
+                out["exhaust"] = value
+        elif unit == "RPM":
+            out["fans"].append({"name": name, "rpm": value})
+        elif unit == "Watts" and ("pwr" in low or "power" in low) and out["power_w"] is None:
+            out["power_w"] = value
+        if low == "fan redundancy":
+            out["fan_redundancy"] = reading
+        # Entity 10 is a power supply; its Status sensor says what's wrong with it.
+        if entity.startswith("10.") and low == "status":
+            state = re.sub(r"^Presence detected,?\s*", "", reading).strip()
+            out["psus"].append({"name": f"PSU{entity.split('.')[1]}", "state": state or "ok"})
+        if status in ("cr", "nr", "nc"):
+            out["problems"].append(f"{name}: {reading or status}")
+    return out
+
+
 def local_ip():
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
@@ -381,6 +432,8 @@ def collect(sample=0.5, top_n=5):
     return {
         "time": datetime.now().isoformat(timespec="seconds"),
         "host": socket.gethostname(),
+        "machine": machine_model(),
+        "ipmi": ipmi_sensors(),
         "os": os_name(),
         "kernel": platform.release(),
         "ip": local_ip(),
@@ -431,6 +484,21 @@ def find_warnings(d, th):
     for k in d["disks"]:
         if k["percent"] >= th["disk_percent"]:
             w.append(f"Disk {k['mount']} {k['percent']:.0f}% full")
+    ip = d.get("ipmi")
+    if ip:
+        if ip["age"] > IPMI_STALE_SECS:
+            w.append(f"Server sensor data is {human_duration(ip['age'])} old "
+                     "(check: systemctl status sysmon-ipmi.timer)")
+        if ip["inlet"] is not None and ip["inlet"] >= th["inlet_temp"]:
+            w.append(f"Inlet air {ip['inlet']:.0f}°C")
+        if ip["exhaust"] is not None and ip["exhaust"] >= th["exhaust_temp"]:
+            w.append(f"Exhaust air {ip['exhaust']:.0f}°C")
+        for psu in ip["psus"]:
+            if psu["state"] != "ok":
+                w.append(f"{psu['name']}: {psu['state']}")
+        if ip["fan_redundancy"] and ip["fan_redundancy"] not in ("Fully Redundant", "Disabled"):
+            w.append(f"Fan redundancy: {ip['fan_redundancy']}")
+        w += ip["problems"]
     return w
 
 
@@ -545,6 +613,41 @@ def render(d, color=True, bar_width=24, compact=False, th=None):
         lines.append(f"  {'SSD':<5}{p('  no sensor', '90')}")
     for f in d["fans"]:
         lines.append(f"  {'Fan':<5}{f['rpm']:5d} RPM")
+
+    ip = d.get("ipmi")
+    if ip:
+        lines.append("")
+        head = p("Server (IPMI)", "1;36")
+        if d.get("machine") and not compact:
+            head += p(f"  {d['machine']}", "90")
+        if ip["age"] > IPMI_STALE_SECS:
+            head += p(f"  data {human_duration(ip['age'])} old", "33")
+        lines.append(head)
+        if ip["inlet"] is not None:
+            lines.append(f"  {'Inlet':<8}{temp(ip['inlet'], th['inlet_temp'] - 5, th['inlet_temp'])}"
+                         + ("" if compact else p("  air in", "90")))
+        if ip["exhaust"] is not None:
+            rise = ""
+            if ip["inlet"] is not None:
+                rise = p(f"  {ip['exhaust'] - ip['inlet']:+.0f}°C over inlet", "90")
+            lines.append(f"  {'Exhaust':<8}{temp(ip['exhaust'], th['exhaust_temp'] - 10, th['exhaust_temp'])}"
+                         + rise)
+        rpms = [f["rpm"] for f in ip["fans"] if f["rpm"] is not None]
+        if rpms:
+            if compact:
+                fans = f"{len(rpms)}× {min(rpms):.0f}–{max(rpms):.0f} RPM"
+            else:
+                fans = (f"{len(rpms)} fans · min {min(rpms):.0f} · avg {sum(rpms) / len(rpms):.0f}"
+                        f" · max {max(rpms):.0f} RPM")
+            red = ip["fan_redundancy"]
+            if red and red != "Disabled" and not compact:
+                fans += " · " + (p(red, "32") if red == "Fully Redundant" else p(red, "31;1"))
+            lines.append(f"  {'Fans':<8}{fans}")
+        if ip["power_w"] is not None:
+            lines.append(f"  {'Power':<8}{ip['power_w']:.0f} W")
+        for psu in ip["psus"]:
+            ok = psu["state"] == "ok"
+            lines.append(f"  {psu['name']:<8}" + (p("ok", "32") if ok else p(psu["state"], "31;1")))
 
     lines.append("")
     b = d["battery"]

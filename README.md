@@ -59,6 +59,36 @@ sleep. Other intervals (45m, 2h30m) count from the last run.
 - User timers run while you're logged in. To keep reports going after logout:
   `sudo loginctl enable-linger $USER`
 
+## Server sensors (IPMI: fans, inlet/exhaust air, power supplies)
+
+On a rack server (Dell iDRAC, HPE iLO, Supermicro, Lenovo XCC) the fans, the air
+temperature going in and out of the chassis, power draw and power supply health
+are read by the server's management chip (BMC), not by Linux. To show them:
+
+```bash
+sudo ./install-ipmi.sh
+```
+
+Reading the BMC needs root, and the same interface can power the server off, so
+sysmon never gets that access itself. The script installs `ipmitool` and a root
+timer (`sysmon-ipmi.timer`) that runs only `ipmitool sdr elist` once a minute and
+saves it to `/run/sysmon/ipmi.txt`. sysmon reads that file and adds:
+
+```
+Server (IPMI)  Dell PowerEdge R640
+  Inlet     32°C  air in
+  Exhaust   42°C  +10°C over inlet
+  Fans    16 fans · min 13440 · avg 15338 · max 17280 RPM · Fully Redundant
+  Power   384 W
+  PSU1    ok
+  PSU2    ok
+```
+
+Reports get a warning when inlet air reaches `inlet_temp` (35°C) or exhaust reaches
+`exhaust_temp` (60°C), when a power supply reports a problem (e.g. AC lost), when fan
+redundancy is lost, when the BMC marks any sensor critical, or when the saved data
+is more than 10 minutes old. Undo with `sudo ./install-ipmi.sh --remove`.
+
 ## Notes on sensors
 
 - Intel integrated graphics (e.g. Iris Xe) have no temperature sensor of their own;
