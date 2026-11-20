@@ -1,0 +1,818 @@
+#!/usr/bin/env python3
+"""sysmon - terminal system overview for Ubuntu, with scheduled Telegram reports.
+
+Usage:
+  sysmon                 show the overview once
+  sysmon watch [-n 2]    live view, refreshes every N seconds (Ctrl+C to quit)
+  sysmon setup           connect a Telegram bot and turn on scheduled reports
+  sysmon send            send a report to Telegram right now
+  sysmon interval 30m    change how often reports are sent (e.g. 15m, 1h, 2h30m)
+  sysmon schedule on|off|status
+  sysmon config          show where settings live and what they are
+"""
+
+import argparse
+import html
+import json
+import os
+import platform
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+try:
+    import psutil
+except ImportError:
+    sys.exit("sysmon needs psutil. Install it with:  sudo apt install python3-psutil")
+
+APP = "sysmon"
+XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+CONFIG_DIR = XDG_CONFIG / APP
+CONFIG_FILE = CONFIG_DIR / "config.json"
+UNIT_DIR = XDG_CONFIG / "systemd" / "user"
+SERVICE_NAME = f"{APP}.service"
+TIMER_NAME = f"{APP}.timer"
+
+DEFAULT_CONFIG = {
+    "bot_token": "",
+    "chat_id": "",
+    "interval": "1h",
+    # A report gets a warning line at the top when any of these is reached.
+    "thresholds": {
+        "cpu_percent": 90,
+        "ram_percent": 90,
+        "disk_percent": 90,
+        "cpu_temp": 85,
+        "gpu_temp": 85,
+        "ssd_temp": 70,
+    },
+}
+
+SKIP_FS = {
+    "squashfs", "tmpfs", "devtmpfs", "overlay", "proc", "sysfs", "efivarfs",
+    "ramfs", "autofs", "nsfs", "fuse.snapfuse", "fuse.portal", "fuse.gvfsd-fuse",
+}
+
+
+# ----------------------------------------------------------------- helpers
+
+def read(path):
+    try:
+        return Path(path).read_text().strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def natural_key(path):
+    m = re.search(r"(\d+)", path.name)
+    return int(m.group(1)) if m else 0
+
+
+def human_bytes(n):
+    if n is None:
+        return "?"
+    n = float(n)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(n) < 1024 or unit == "TiB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def human_duration(secs):
+    secs = int(secs)
+    d, rem = divmod(secs, 86400)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
+    parts = []
+    if d:
+        parts.append(f"{d}d")
+    if h:
+        parts.append(f"{h}h")
+    if m or not parts:
+        parts.append(f"{m}m")
+    return " ".join(parts)
+
+
+def parse_interval(text):
+    """'90' (minutes), '30m', '1h', '2h30m', '1d' -> seconds."""
+    s = text.strip().lower().replace(" ", "")
+    if s.isdigit():
+        secs = int(s) * 60
+    elif re.fullmatch(r"(\d+[smhd])+", s):
+        mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+        secs = sum(int(n) * mult[u] for n, u in re.findall(r"(\d+)([smhd])", s))
+    else:
+        raise ValueError(f"can't read interval '{text}'. Try 15m, 1h, 2h30m or 1d.")
+    if secs < 60:
+        raise ValueError("interval must be at least 1 minute.")
+    return secs
+
+
+def format_interval(secs):
+    out = ""
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60), ("s", 1)):
+        if secs >= size:
+            n, secs = divmod(secs, size)
+            out += f"{n}{unit}"
+    return out
+
+
+# ------------------------------------------------------------------ config
+
+def load_config():
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+    if CONFIG_FILE.exists():
+        try:
+            saved = json.loads(CONFIG_FILE.read_text())
+        except json.JSONDecodeError as e:
+            sys.exit(f"{CONFIG_FILE} is not valid JSON: {e}")
+        thresholds = {**cfg["thresholds"], **saved.get("thresholds", {})}
+        cfg.update(saved)
+        cfg["thresholds"] = thresholds
+    cfg["bot_token"] = os.environ.get("SYSMON_BOT_TOKEN", cfg["bot_token"])
+    cfg["chat_id"] = os.environ.get("SYSMON_CHAT_ID", str(cfg["chat_id"]))
+    return cfg
+
+
+def save_config(cfg):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cfg, indent=2) + "\n")
+    os.chmod(tmp, 0o600)  # holds the bot token
+    tmp.replace(CONFIG_FILE)
+
+
+# ---------------------------------------------------------- data gathering
+
+def hwmon_temps():
+    """Every temperature sensor the kernel exposes, with its chip and device."""
+    rows = []
+    for hw in sorted(Path("/sys/class/hwmon").glob("hwmon*"), key=natural_key):
+        chip = read(hw / "name") or hw.name
+        dev = (hw / "device").resolve() if (hw / "device").exists() else None
+        for f in sorted(hw.glob("temp*_input"), key=natural_key):
+            prefix = f.name[: -len("_input")]
+            try:
+                c = int(read(f)) / 1000
+            except (TypeError, ValueError):
+                continue
+            if not 0 < c < 150:
+                continue
+            rows.append({"chip": chip, "label": read(hw / f"{prefix}_label") or "",
+                         "temp": c, "dev": dev})
+    return rows
+
+
+def pick_temp(rows, chip, labels=None):
+    for r in rows:
+        if r["chip"] == chip and (labels is None or r["label"] in labels):
+            return r["temp"]
+    return None
+
+
+def cpu_temp(rows):
+    for chip, labels in (
+        ("coretemp", {"Package id 0"}),
+        ("k10temp", {"Tctl", "Tdie"}),
+        ("zenpower", {"Tdie", "Tctl"}),
+        ("thinkpad", {"CPU"}),
+        ("cpu_thermal", None),
+        ("acpitz", None),
+    ):
+        t = pick_temp(rows, chip, labels)
+        if t is not None:
+            return t
+    return None
+
+
+def cpu_model():
+    for line in (read("/proc/cpuinfo") or "").splitlines():
+        if line.startswith("model name"):
+            name = line.split(":", 1)[1].strip()
+            name = re.sub(r"\((R|TM)\)", "", name)
+            name = re.sub(r"\s+CPU\s+", " ", name)
+            return re.sub(r"\s+", " ", name)
+    return platform.processor() or "CPU"
+
+
+def pci_name(slot):
+    if not shutil.which("lspci"):
+        return None
+    try:
+        out = subprocess.run(["lspci", "-s", slot], capture_output=True,
+                             text=True, timeout=3).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if ": " not in out:
+        return None
+    name = out.split(": ", 1)[1]
+    name = re.sub(r"\s*\(rev \w+\)$", "", name)
+    name = name.replace("Advanced Micro Devices, Inc.", "AMD").replace(" Corporation", "")
+    return name
+
+
+def gpus(rows):
+    out = []
+    nvidia_done = False
+    if shutil.which("nvidia-smi"):
+        try:
+            res = subprocess.run(
+                ["nvidia-smi",
+                 "--query-gpu=name,temperature.gpu,utilization.gpu,memory.used,memory.total",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=5)
+            for line in res.stdout.strip().splitlines():
+                name, t, u, mu, mt = [x.strip() for x in line.split(",")]
+                num = lambda v: float(v) if re.fullmatch(r"[\d.]+", v) else None
+                out.append({"name": name, "temp": num(t), "util": num(u),
+                            "mem_used": (num(mu) or 0) * 2**20 if num(mu) is not None else None,
+                            "mem_total": (num(mt) or 0) * 2**20 if num(mt) is not None else None})
+                nvidia_done = True
+        except (OSError, subprocess.SubprocessError, ValueError):
+            pass
+
+    seen = set()
+    for card in sorted(Path("/sys/class/drm").glob("card[0-9]*"), key=natural_key):
+        if "-" in card.name or not (card / "device").exists():
+            continue
+        dev = (card / "device").resolve()
+        if dev in seen:
+            continue
+        seen.add(dev)
+        vendor = read(dev / "vendor")
+        if vendor == "0x10de" and nvidia_done:
+            continue
+        g = {"name": pci_name(dev.name) or f"GPU {dev.name}", "temp": None,
+             "util": None, "mem_used": None, "mem_total": None, "on_die": False,
+             "integrated": vendor == "0x8086" and dev.name.startswith("0000:00:")}
+        own = [r for r in rows if r["dev"] == dev]
+        if own:
+            preferred = [r for r in own if r["label"] in ("edge", "pkg", "")]
+            g["temp"] = (preferred or own)[0]["temp"]
+        busy = read(dev / "gpu_busy_percent")
+        if busy and busy.isdigit():
+            g["util"] = float(busy)
+        used, total = read(dev / "mem_info_vram_used"), read(dev / "mem_info_vram_total")
+        if used and total and used.isdigit() and total.isdigit():
+            g["mem_used"], g["mem_total"] = int(used), int(total)
+        out.append(g)
+
+    # ThinkPads report the GPU temperature through the thinkpad_acpi sensor.
+    tp = pick_temp(rows, "thinkpad", {"GPU"})
+    if tp is not None:
+        for g in out:
+            if g["temp"] is None:
+                g["temp"] = tp
+                break
+    # Intel integrated graphics sit on the CPU die and have no sensor of their own.
+    for g in out:
+        if g["temp"] is None and g.get("integrated"):
+            g["temp"], g["on_die"] = cpu_temp(rows), True
+    return out
+
+
+def ssds(rows):
+    out, seen = [], set()
+    # Prefer the "Composite" reading for NVMe drives; it's the drive's own summary.
+    ordered = sorted(rows, key=lambda r: r["label"] != "Composite")
+    for r in ordered:
+        if r["chip"] not in ("nvme", "drivetemp") or r["dev"] is None or r["dev"] in seen:
+            continue
+        seen.add(r["dev"])
+        model = read(r["dev"] / "model") or r["dev"].name
+        out.append({"name": re.sub(r"\s+", " ", model), "dev": r["dev"].name, "temp": r["temp"]})
+    return out
+
+
+def disks():
+    out, seen = [], set()
+    for p in psutil.disk_partitions(all=False):
+        if (p.fstype in SKIP_FS or p.device.startswith("/dev/loop")
+                or p.mountpoint.startswith("/snap") or p.device in seen):
+            continue
+        seen.add(p.device)
+        try:
+            u = psutil.disk_usage(p.mountpoint)
+        except OSError:
+            continue
+        out.append({"mount": p.mountpoint, "device": p.device, "fstype": p.fstype,
+                    "used": u.used, "total": u.total, "percent": u.percent})
+    return out
+
+
+def local_ip():
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("10.255.255.255", 1))  # no packet is sent
+            return s.getsockname()[0]
+    except OSError:
+        return None
+
+
+def os_name():
+    for line in (read("/etc/os-release") or "").splitlines():
+        if line.startswith("PRETTY_NAME="):
+            return line.split("=", 1)[1].strip('"')
+    return platform.platform()
+
+
+def collect(sample=0.5, top_n=5):
+    procs = []
+    for p in psutil.process_iter(["pid", "name"]):
+        try:
+            p.cpu_percent(None)
+            procs.append(p)
+        except psutil.Error:
+            pass
+    psutil.cpu_percent(None)
+    psutil.cpu_percent(None, percpu=True)
+    time.sleep(sample)
+    total = psutil.cpu_percent(None)
+    per_core = psutil.cpu_percent(None, percpu=True)
+
+    ncpu = psutil.cpu_count() or 1
+    top = []
+    for p in procs:
+        try:
+            top.append({"pid": p.pid, "name": p.info["name"],
+                        "cpu": p.cpu_percent(None) / ncpu, "mem": p.memory_percent()})
+        except psutil.Error:
+            pass
+    top.sort(key=lambda x: x["cpu"], reverse=True)
+
+    rows = hwmon_temps()
+    freq = psutil.cpu_freq()
+    vm, sw = psutil.virtual_memory(), psutil.swap_memory()
+    net = psutil.net_io_counters()
+    batt = psutil.sensors_battery() if hasattr(psutil, "sensors_battery") else None
+    fans = []
+    try:
+        for chip, entries in (psutil.sensors_fans() or {}).items():
+            fans += [{"chip": chip, "label": e.label, "rpm": e.current} for e in entries]
+    except (AttributeError, OSError):
+        pass
+
+    return {
+        "time": datetime.now().isoformat(timespec="seconds"),
+        "host": socket.gethostname(),
+        "os": os_name(),
+        "kernel": platform.release(),
+        "ip": local_ip(),
+        "uptime": time.time() - psutil.boot_time(),
+        "load": os.getloadavg(),
+        "cpu": {
+            "model": cpu_model(),
+            "cores": psutil.cpu_count(logical=False),
+            "threads": psutil.cpu_count(),
+            "freq_mhz": freq.current if freq else None,
+            "percent": total,
+            "per_core": per_core,
+            "temp": cpu_temp(rows),
+            "core_temps": [r["temp"] for r in rows
+                           if r["chip"] == "coretemp" and r["label"].startswith("Core")],
+        },
+        "ram": {"used": vm.total - vm.available, "total": vm.total, "percent": vm.percent},
+        "swap": {"used": sw.used, "total": sw.total, "percent": sw.percent},
+        "gpus": gpus(rows),
+        "ssds": ssds(rows),
+        "disks": disks(),
+        "net": {"sent": net.bytes_sent, "recv": net.bytes_recv},
+        "battery": None if batt is None else {
+            "percent": batt.percent, "plugged": batt.power_plugged,
+            "secs_left": batt.secsleft if isinstance(batt.secsleft, int) and batt.secsleft > 0 else None,
+        },
+        "fans": fans,
+        "top": top[:top_n],
+    }
+
+
+def find_warnings(d, th):
+    w = []
+    c = d["cpu"]
+    if c["temp"] is not None and c["temp"] >= th["cpu_temp"]:
+        w.append(f"CPU temperature {c['temp']:.0f}°C")
+    if c["percent"] >= th["cpu_percent"]:
+        w.append(f"CPU usage {c['percent']:.0f}%")
+    if d["ram"]["percent"] >= th["ram_percent"]:
+        w.append(f"RAM usage {d['ram']['percent']:.0f}%")
+    for g in d["gpus"]:
+        if g["temp"] is not None and not g.get("on_die") and g["temp"] >= th["gpu_temp"]:
+            w.append(f"GPU temperature {g['temp']:.0f}°C")
+    for s in d["ssds"]:
+        if s["temp"] >= th["ssd_temp"]:
+            w.append(f"SSD {s['dev']} temperature {s['temp']:.0f}°C")
+    for k in d["disks"]:
+        if k["percent"] >= th["disk_percent"]:
+            w.append(f"Disk {k['mount']} {k['percent']:.0f}% full")
+    return w
+
+
+# --------------------------------------------------------------- rendering
+
+class Paint:
+    def __init__(self, on):
+        self.on = on
+
+    def __call__(self, text, code):
+        return f"\033[{code}m{text}\033[0m" if self.on else text
+
+    def level(self, text, value, warn, crit):
+        if value is None:
+            return text
+        return self(text, "31;1" if value >= crit else "33" if value >= warn else "32")
+
+
+def render(d, color=True, bar_width=24, compact=False, th=None):
+    th = th or DEFAULT_CONFIG["thresholds"]
+    p = Paint(color)
+    lines = []
+
+    def bar(pct):
+        fill = max(0, min(bar_width, round(pct / 100 * bar_width)))
+        return p.level("█" * fill, pct, 60, 85) + p("░" * (bar_width - fill), "90")
+
+    def temp(t, warn, crit):
+        return p("  n/a", "90") if t is None else p.level(f"{t:4.0f}°C", t, warn, crit)
+
+    def label(text):
+        return p(f"{text:<6}", "1;36")
+
+    def row(name, body):
+        lines.append(f"{label(name)} {body}")
+
+    stamp = datetime.fromisoformat(d["time"]).strftime("%Y-%m-%d %H:%M")
+    lines.append(p(f"{d['host']}", "1") + p(f" · {d['os']} · {stamp}", "90"))
+    load = " ".join(f"{x:.2f}" for x in d["load"])
+    extra = f" · IP {d['ip']}" if d["ip"] and not compact else ""
+    lines.append(p(f"up {human_duration(d['uptime'])} · load {load}{extra}", "90"))
+    lines.append("")
+
+    c = d["cpu"]
+    freq = f" · {c['freq_mhz'] / 1000:.1f} GHz" if c["freq_mhz"] else ""
+    if not compact:
+        row("CPU", p(f"{c['model']} · {c['cores']}C/{c['threads']}T{freq}", "90"))
+        row("", f"{bar(c['percent'])} {c['percent']:5.1f}%  {temp(c['temp'], 70, th['cpu_temp'])}")
+        cores = " ".join(p.level(f"{x:3.0f}", x, 60, 85) for x in c["per_core"])
+        row("", p("threads %:", "90") + " " + cores)
+        if c["core_temps"]:
+            row("", p("cores °C: ", "90") + " " + " ".join(
+                p.level(f"{t:3.0f}", t, 70, th["cpu_temp"]) for t in c["core_temps"]))
+    else:
+        row("CPU", f"{bar(c['percent'])} {c['percent']:5.1f}%")
+
+    r = d["ram"]
+    row("RAM", f"{bar(r['percent'])} {r['percent']:5.1f}%  "
+               f"{human_bytes(r['used'])} / {human_bytes(r['total'])}")
+    s = d["swap"]
+    if s["total"]:
+        row("Swap", f"{bar(s['percent'])} {s['percent']:5.1f}%  "
+                    f"{human_bytes(s['used'])} / {human_bytes(s['total'])}")
+
+    lines.append("")
+    for k in d["disks"]:
+        name = k["mount"] if len(k["mount"]) <= 14 else "…" + k["mount"][-13:]
+        if compact:
+            row("Disk", f"{name}")
+            row("", f"{bar(k['percent'])} {k['percent']:5.1f}%  "
+                    f"{human_bytes(k['used'])} / {human_bytes(k['total'])}")
+        else:
+            row("Disk", f"{name:<14} {bar(k['percent'])} {k['percent']:5.1f}%  "
+                        f"{human_bytes(k['used'])} / {human_bytes(k['total'])}")
+
+    lines.append("")
+    lines.append(p("Temperatures", "1;36"))
+    lines.append(f"  {'CPU':<5}{temp(c['temp'], 70, th['cpu_temp'])}" +
+                 ("" if compact else p(f"  {c['model']}", "90")))
+    if d["gpus"]:
+        for g in d["gpus"]:
+            extra = ""
+            if g["util"] is not None:
+                extra += f"  {g['util']:.0f}% busy"
+            if g["mem_total"]:
+                extra += f"  VRAM {human_bytes(g['mem_used'])} / {human_bytes(g['mem_total'])}"
+            if g.get("on_die"):
+                extra += p(" (CPU die)", "90")
+            name = "" if compact else p(f"  {g['name']}", "90")
+            lines.append(f"  {'GPU':<5}{temp(g['temp'], 70, th['gpu_temp'])}{extra}{name}")
+    else:
+        lines.append(f"  {'GPU':<5}{p('  none found', '90')}")
+    if d["ssds"]:
+        for sd in d["ssds"]:
+            name = "" if compact else p(f"  {sd['name']} ({sd['dev']})", "90")
+            lines.append(f"  {'SSD':<5}{temp(sd['temp'], 55, th['ssd_temp'])}{name}")
+    else:
+        lines.append(f"  {'SSD':<5}{p('  no sensor', '90')}")
+    for f in d["fans"]:
+        lines.append(f"  {'Fan':<5}{f['rpm']:5d} RPM")
+
+    lines.append("")
+    b = d["battery"]
+    if b:
+        state = "charging" if b["plugged"] else "on battery"
+        left = f", {human_duration(b['secs_left'])} left" if b["secs_left"] and not b["plugged"] else ""
+        row("Batt", f"{b['percent']:.0f}% ({state}{left})")
+    row("Net", f"↑ {human_bytes(d['net']['sent'])}  ↓ {human_bytes(d['net']['recv'])}"
+               + p("  since boot", "90"))
+
+    top = d["top"][: 3 if compact else 5]
+    if top:
+        lines.append("")
+        lines.append(p("Top processes", "1;36") + p("  (CPU% of whole system, MEM%)", "90"))
+        for t in top:
+            name = t["name"][:18]
+            lines.append(f"  {name:<18} {t['cpu']:5.1f}%  {t['mem']:5.1f}%")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- telegram
+
+class TelegramError(Exception):
+    pass
+
+
+def tg(token, method, params=None, timeout=20):
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    data = urllib.parse.urlencode(params).encode() if params else None
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=timeout) as r:
+            body = json.load(r)
+    except urllib.error.HTTPError as e:
+        try:
+            body = json.load(e)
+        except (json.JSONDecodeError, ValueError):
+            raise TelegramError(f"HTTP {e.code}") from None
+    except (urllib.error.URLError, OSError) as e:
+        raise TelegramError(f"network error: {getattr(e, 'reason', e)}") from None
+    if not body.get("ok"):
+        raise TelegramError(body.get("description", "unknown error"))
+    return body["result"]
+
+
+def telegram_message(d, th):
+    warns = find_warnings(d, th)
+    head = f"<b>🖥 {html.escape(d['host'])} system report</b>"
+    if warns:
+        head += "\n" + "\n".join(f"⚠️ {html.escape(w)}" for w in warns)
+    body = render(d, color=False, bar_width=10, compact=True, th=th)
+    return f"{head}\n<pre>{html.escape(body)}</pre>"
+
+
+def send_report(cfg, retries=3, quiet=False):
+    if not cfg["bot_token"] or not cfg["chat_id"]:
+        sys.exit("Telegram isn't set up yet. Run:  sysmon setup")
+    text = telegram_message(collect(), cfg["thresholds"])
+    for attempt in range(1, retries + 1):
+        try:
+            tg(cfg["bot_token"], "sendMessage",
+               {"chat_id": cfg["chat_id"], "text": text, "parse_mode": "HTML"})
+            if not quiet:
+                print("Report sent to Telegram.")
+            return
+        except TelegramError as e:
+            if attempt == retries or "network" not in str(e):
+                sys.exit(f"Telegram send failed: {e}")
+            time.sleep(15)  # network may still be coming up after resume
+
+
+# ---------------------------------------------------------------- schedule
+
+def systemctl(*args, check=True):
+    res = subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True)
+    if check and res.returncode != 0:
+        sys.exit(f"systemctl --user {' '.join(args)} failed:\n{res.stderr.strip()}")
+    return res
+
+
+def on_calendar(secs):
+    """Wall-clock schedule when the interval divides an hour or a day evenly.
+
+    Calendar timers survive laptop suspend (Persistent=true catches up a missed
+    run); plain monotonic timers pause while the machine sleeps.
+    """
+    if secs % 60 == 0 and secs < 3600 and 3600 % secs == 0:
+        return f"*-*-* *:00/{secs // 60}:00"
+    if secs == 3600:
+        return "*-*-* *:00:00"
+    if secs == 86400:
+        return "*-*-* 00:00:00"
+    if secs % 3600 == 0 and secs < 86400 and 86400 % secs == 0:
+        return f"*-*-* 00/{secs // 3600}:00:00"
+    return None
+
+
+def install_timer(cfg):
+    if not shutil.which("systemctl"):
+        sys.exit("systemctl not found; scheduled reports need systemd.")
+    secs = parse_interval(cfg["interval"])
+    script = Path(__file__).resolve()
+    UNIT_DIR.mkdir(parents=True, exist_ok=True)
+    (UNIT_DIR / SERVICE_NAME).write_text(
+        "[Unit]\n"
+        "Description=sysmon Telegram system report\n\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        f"ExecStart={sys.executable} {script} send --quiet\n")
+    cal = on_calendar(secs)
+    when = (f"OnCalendar={cal}\nPersistent=true\n" if cal
+            else f"OnBootSec=2min\nOnUnitActiveSec={secs}s\n")
+    (UNIT_DIR / TIMER_NAME).write_text(
+        "[Unit]\n"
+        f"Description=Send sysmon report every {format_interval(secs)}\n\n"
+        "[Timer]\n"
+        f"{when}"
+        "AccuracySec=30s\n\n"
+        "[Install]\n"
+        "WantedBy=timers.target\n")
+    systemctl("daemon-reload")
+    systemctl("enable", TIMER_NAME)
+    systemctl("restart", TIMER_NAME)
+
+
+def remove_timer():
+    systemctl("disable", "--now", TIMER_NAME, check=False)
+    for name in (TIMER_NAME, SERVICE_NAME):
+        (UNIT_DIR / name).unlink(missing_ok=True)
+    systemctl("daemon-reload", check=False)
+
+
+def timer_enabled():
+    return systemctl("is-enabled", TIMER_NAME, check=False).stdout.strip() == "enabled"
+
+
+def next_run():
+    res = systemctl("show", TIMER_NAME, "--property=NextElapseUSecRealtime", "--value", check=False)
+    return res.stdout.strip() or None
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_show(args, cfg):
+    d = collect()
+    if args.json:
+        print(json.dumps(d, indent=2, default=str))
+        return
+    color = sys.stdout.isatty() and not args.no_color
+    print(render(d, color=color, th=cfg["thresholds"]))
+    warns = find_warnings(d, cfg["thresholds"])
+    if warns:
+        p = Paint(color)
+        print()
+        for w in warns:
+            print(p(f"⚠  {w}", "31;1"))
+
+
+def cmd_watch(args, cfg):
+    color = sys.stdout.isatty() and not args.no_color
+    try:
+        while True:
+            start = time.time()
+            out = render(collect(sample=min(0.5, args.n)), color=color, th=cfg["thresholds"])
+            sys.stdout.write("\033[H\033[2J" + out + "\n\n" +
+                             Paint(color)(f"refresh every {args.n}s · Ctrl+C to quit", "90") + "\n")
+            sys.stdout.flush()
+            time.sleep(max(0, args.n - (time.time() - start)))
+    except KeyboardInterrupt:
+        print()
+
+
+def cmd_send(args, cfg):
+    send_report(cfg, quiet=args.quiet)
+
+
+def cmd_setup(args, cfg):
+    print("Telegram setup\n")
+    print("1. In Telegram, open @BotFather, send /newbot, and copy the token it gives you.")
+    token = input(f"   Bot token{' [keep current]' if cfg['bot_token'] else ''}: ").strip() or cfg["bot_token"]
+    if not token:
+        sys.exit("A bot token is required.")
+    try:
+        me = tg(token, "getMe")
+    except TelegramError as e:
+        sys.exit(f"That token didn't work: {e}")
+    print(f"   OK, connected to @{me['username']}.\n")
+
+    print(f"2. Open https://t.me/{me['username']} and send it any message (e.g. /start).")
+    input("   Press Enter once you've sent it...")
+    chat_id = None
+    try:
+        updates = tg(token, "getUpdates", {"timeout": 0})
+        for u in reversed(updates):
+            msg = u.get("message") or u.get("channel_post") or {}
+            if msg.get("chat"):
+                chat_id = msg["chat"]["id"]
+                who = msg["chat"].get("username") or msg["chat"].get("title") or msg["chat"].get("first_name")
+                print(f"   Found chat: {who} (id {chat_id})")
+                break
+    except TelegramError as e:
+        print(f"   Couldn't read messages: {e}")
+    if chat_id is None:
+        chat_id = input(f"   No message found. Enter chat id manually"
+                        f"{' [keep current]' if cfg['chat_id'] else ''}: ").strip() or cfg["chat_id"]
+    if not chat_id:
+        sys.exit("A chat id is required.")
+
+    print()
+    while True:
+        raw = input(f"3. How often should reports be sent? [{cfg['interval']}]: ").strip() or cfg["interval"]
+        try:
+            secs = parse_interval(raw)
+            break
+        except ValueError as e:
+            print(f"   {e}")
+
+    cfg.update(bot_token=token, chat_id=str(chat_id), interval=format_interval(secs))
+    save_config(cfg)
+    print(f"\nSaved to {CONFIG_FILE}")
+    send_report(cfg)
+    install_timer(cfg)
+    print(f"Scheduled: a report every {cfg['interval']}. Next run: {next_run()}")
+
+
+def cmd_interval(args, cfg):
+    if not args.value:
+        print(f"Reports are sent every {cfg['interval']}"
+              f"{'' if timer_enabled() else ' (schedule is off)'}.")
+        return
+    try:
+        secs = parse_interval(args.value)
+    except ValueError as e:
+        sys.exit(str(e))
+    cfg["interval"] = format_interval(secs)
+    save_config(cfg)
+    if timer_enabled():
+        install_timer(cfg)
+        print(f"Interval set to {cfg['interval']}. Next report: {next_run()}")
+    else:
+        print(f"Interval set to {cfg['interval']}. Turn reports on with:  sysmon schedule on")
+
+
+def cmd_schedule(args, cfg):
+    if args.action == "on":
+        if not cfg["bot_token"] or not cfg["chat_id"]:
+            sys.exit("Telegram isn't set up yet. Run:  sysmon setup")
+        install_timer(cfg)
+        print(f"Reports on: every {cfg['interval']}. Next run: {next_run()}")
+    elif args.action == "off":
+        remove_timer()
+        print("Scheduled reports turned off.")
+    else:
+        if timer_enabled():
+            print(f"Reports on: every {cfg['interval']}. Next run: {next_run()}")
+            last = systemctl("show", SERVICE_NAME, "--property=ExecMainExitTimestamp",
+                             "--value", check=False).stdout.strip()
+            if last:
+                print(f"Last run: {last}")
+            print("Logs: journalctl --user -u sysmon.service")
+        else:
+            print("Scheduled reports are off. Turn on with:  sysmon schedule on")
+
+
+def cmd_config(args, cfg):
+    tok = cfg["bot_token"]
+    masked = (tok[:6] + "…" + tok[-4:]) if len(tok) > 12 else ("(not set)" if not tok else "***")
+    print(f"Config file: {CONFIG_FILE}")
+    print(f"Bot token:   {masked}")
+    print(f"Chat id:     {cfg['chat_id'] or '(not set)'}")
+    print(f"Interval:    {cfg['interval']}  ({'on' if timer_enabled() else 'off'})")
+    print("Thresholds:  " + ", ".join(f"{k}={v}" for k, v in cfg["thresholds"].items()))
+
+
+def main():
+    ap = argparse.ArgumentParser(prog=APP, description="System overview in the terminal, with Telegram reports.")
+    ap.add_argument("--no-color", action="store_true", help="plain output")
+    sub = ap.add_subparsers(dest="cmd")
+
+    s = sub.add_parser("show", help="show the overview once (default)")
+    s.add_argument("--json", action="store_true", help="print raw data as JSON")
+    w = sub.add_parser("watch", help="live view")
+    w.add_argument("-n", type=float, default=2, help="refresh every N seconds (default 2)")
+    sub.add_parser("setup", help="connect Telegram and turn on scheduled reports")
+    se = sub.add_parser("send", help="send a report to Telegram now")
+    se.add_argument("--quiet", action="store_true")
+    i = sub.add_parser("interval", help="show or set the report interval (e.g. 30m, 1h, 2h)")
+    i.add_argument("value", nargs="?")
+    sc = sub.add_parser("schedule", help="turn scheduled reports on/off or show status")
+    sc.add_argument("action", choices=["on", "off", "status"], nargs="?", default="status")
+    sub.add_parser("config", help="show current settings")
+
+    args = ap.parse_args()
+    cfg = load_config()
+    handlers = {"show": cmd_show, "watch": cmd_watch, "setup": cmd_setup, "send": cmd_send,
+                "interval": cmd_interval, "schedule": cmd_schedule, "config": cmd_config}
+    if args.cmd is None:
+        args.cmd, args.json = "show", False
+    if args.cmd == "watch" and args.n <= 0:
+        sys.exit("-n must be greater than 0")
+    handlers[args.cmd](args, cfg)
+
+
+if __name__ == "__main__":
+    main()
