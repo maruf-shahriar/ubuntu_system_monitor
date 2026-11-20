@@ -31,6 +31,7 @@ This links `~/.local/bin/sysmon` to this folder, so keep the folder where it is
 | `sysmon interval` | Show the current interval |
 | `sysmon interval 30m` | Change the interval (`15m`, `1h`, `2h30m`, `1d`; a bare number means minutes) |
 | `sysmon schedule on` / `off` / `status` | Turn reports on or off, or see the next run |
+| `sysmon bot on` / `off` / `status` | Answer commands sent to the bot (see below) |
 | `sysmon config` | Show settings (token is masked) |
 
 ## Telegram setup
@@ -48,6 +49,30 @@ You can edit `thresholds` there to change when warnings appear:
                 "cpu_temp": 85, "gpu_temp": 85, "ssd_temp": 70 }
 ```
 
+## Bot commands
+
+`sysmon setup` asks whether the bot should answer commands; or turn it on later
+with `sysmon bot on`. Send these to your bot:
+
+| Command | Reply |
+|---|---|
+| `/status` | Full report, right now |
+| `/temp` | CPU, GPU, SSD temperatures (and inlet/exhaust air on servers) |
+| `/fans` | Fan speeds, power draw and power supplies |
+| `/disk` | Disk usage |
+| `/top` | CPU/RAM usage and the 10 busiest processes |
+| `/interval` | Show the report interval; `/interval 30m` changes it |
+| `/help` | List commands |
+
+- Only the chat saved in `sysmon setup` gets answers; messages from anyone else are
+  ignored. Commands that waited more than 5 minutes (bot was off) are skipped.
+- The bot can only run these fixed commands, never shell commands, so a leaked
+  token can't be used to run anything on the machine.
+- **One bot per machine.** Telegram lets only one program read a bot's messages.
+  If the laptop and a server share a token, give each its own bot via @BotFather.
+- It runs as the user service `sysmon-bot.service`.
+  Logs: `journalctl --user -u sysmon-bot.service`
+
 ## How the schedule works
 
 `sysmon` writes `~/.config/systemd/user/sysmon.{service,timer}`.
@@ -56,7 +81,8 @@ run on the clock (e.g. every hour at :00) and catch up after the laptop wakes fr
 sleep. Other intervals (45m, 2h30m) count from the last run.
 
 - Logs: `journalctl --user -u sysmon.service`
-- User timers run while you're logged in. To keep reports going after logout:
+- User timers and the bot run while you're logged in. On a server you reach over
+  SSH they stop when you disconnect, so turn on lingering:
   `sudo loginctl enable-linger $USER`
 
 ## Server sensors (IPMI: fans, inlet/exhaust air, power supplies)

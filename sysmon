@@ -43,6 +43,9 @@ TIMER_NAME = f"{APP}.timer"
 # Written once a minute by the root timer from install-ipmi.sh.
 IPMI_FILE = Path(os.environ.get("SYSMON_IPMI_FILE", "/run/sysmon/ipmi.txt"))
 IPMI_STALE_SECS = 600
+BOT_SERVICE_NAME = f"{APP}-bot.service"
+TELEGRAM_API = os.environ.get("SYSMON_TELEGRAM_API", "https://api.telegram.org")
+BOT_MAX_AGE_SECS = 300  # ignore commands that waited longer than this (bot was off)
 
 DEFAULT_CONFIG = {
     "bot_token": "",
@@ -526,10 +529,17 @@ def spread(values, fmt, p, limit=16):
             + p(f"  ({len(values)} values)", "90"))
 
 
-def render(d, color=True, bar_width=24, compact=False, th=None):
+SECTIONS = ("head", "usage", "disk", "temp", "server", "misc", "top")
+
+
+def render(d, color=True, bar_width=24, compact=False, th=None, sections=None, top_n=None):
+    """Text overview. `sections` limits it to some of SECTIONS (used by bot commands)."""
     th = th or DEFAULT_CONFIG["thresholds"]
     p = Paint(color)
-    lines = []
+    blocks = []
+
+    def want(name):
+        return sections is None or name in sections
 
     def bar(pct):
         fill = max(0, min(bar_width, round(pct / 100 * bar_width)))
@@ -538,100 +548,106 @@ def render(d, color=True, bar_width=24, compact=False, th=None):
     def temp(t, warn, crit):
         return p("  n/a", "90") if t is None else p.level(f"{t:4.0f}°C", t, warn, crit)
 
-    def label(text):
-        return p(f"{text:<6}", "1;36")
-
-    def row(name, body):
-        lines.append(f"{label(name)} {body}")
-
-    stamp = datetime.fromisoformat(d["time"]).strftime("%Y-%m-%d %H:%M")
-    lines.append(p(f"{d['host']}", "1") + p(f" · {d['os']} · {stamp}", "90"))
-    load = " ".join(f"{x:.2f}" for x in d["load"])
-    extra = f" · IP {d['ip']}" if d["ip"] and not compact else ""
-    lines.append(p(f"up {human_duration(d['uptime'])} · load {load}{extra}", "90"))
-    lines.append("")
+    def row(out, name, body):
+        out.append(p(f"{name:<6}", "1;36") + " " + body)
 
     c = d["cpu"]
-    freq = f" · {c['freq_mhz'] / 1000:.1f} GHz" if c["freq_mhz"] else ""
-    if not compact:
-        row("CPU", p(f"{c['model']} · {c['cores']}C/{c['threads']}T{freq}", "90"))
-        row("", f"{bar(c['percent'])} {c['percent']:5.1f}%  {temp(c['temp'], 70, th['cpu_temp'])}")
-        row("", p("threads %:", "90") + " " + spread(
-            c["per_core"], lambda x: p.level(f"{x:3.0f}", x, 60, 85), p))
-        multi = len(c["packages"]) > 1
-        for pk in c["packages"]:
-            if pk["core_temps"]:
-                name = f"{pk['name']} °C:" if multi else "cores °C:"
-                row("", p(f"{name:<10}", "90") + " " + spread(
-                    pk["core_temps"], lambda t: p.level(f"{t:3.0f}", t, 70, th["cpu_temp"]), p))
-    else:
-        row("CPU", f"{bar(c['percent'])} {c['percent']:5.1f}%")
 
-    r = d["ram"]
-    row("RAM", f"{bar(r['percent'])} {r['percent']:5.1f}%  "
-               f"{human_bytes(r['used'])} / {human_bytes(r['total'])}")
-    s = d["swap"]
-    if s["total"]:
-        row("Swap", f"{bar(s['percent'])} {s['percent']:5.1f}%  "
-                    f"{human_bytes(s['used'])} / {human_bytes(s['total'])}")
+    if want("head"):
+        out = []
+        stamp = datetime.fromisoformat(d["time"]).strftime("%Y-%m-%d %H:%M")
+        out.append(p(f"{d['host']}", "1") + p(f" · {d['os']} · {stamp}", "90"))
+        load = " ".join(f"{x:.2f}" for x in d["load"])
+        extra = f" · IP {d['ip']}" if d["ip"] and not compact else ""
+        out.append(p(f"up {human_duration(d['uptime'])} · load {load}{extra}", "90"))
+        blocks.append(out)
 
-    lines.append("")
-    for k in d["disks"]:
-        name = k["mount"] if len(k["mount"]) <= 14 else "…" + k["mount"][-13:]
-        if compact:
-            row("Disk", f"{name}")
-            row("", f"{bar(k['percent'])} {k['percent']:5.1f}%  "
-                    f"{human_bytes(k['used'])} / {human_bytes(k['total'])}")
+    if want("usage"):
+        out = []
+        freq = f" · {c['freq_mhz'] / 1000:.1f} GHz" if c["freq_mhz"] else ""
+        if not compact:
+            row(out, "CPU", p(f"{c['model']} · {c['cores']}C/{c['threads']}T{freq}", "90"))
+            row(out, "", f"{bar(c['percent'])} {c['percent']:5.1f}%  "
+                         f"{temp(c['temp'], 70, th['cpu_temp'])}")
+            row(out, "", p("threads %:", "90") + " " + spread(
+                c["per_core"], lambda x: p.level(f"{x:3.0f}", x, 60, 85), p))
+            multi = len(c["packages"]) > 1
+            for pk in c["packages"]:
+                if pk["core_temps"]:
+                    name = f"{pk['name']} °C:" if multi else "cores °C:"
+                    row(out, "", p(f"{name:<10}", "90") + " " + spread(
+                        pk["core_temps"], lambda t: p.level(f"{t:3.0f}", t, 70, th["cpu_temp"]), p))
         else:
-            row("Disk", f"{name:<14} {bar(k['percent'])} {k['percent']:5.1f}%  "
-                        f"{human_bytes(k['used'])} / {human_bytes(k['total'])}")
+            row(out, "CPU", f"{bar(c['percent'])} {c['percent']:5.1f}%")
+        r = d["ram"]
+        row(out, "RAM", f"{bar(r['percent'])} {r['percent']:5.1f}%  "
+                        f"{human_bytes(r['used'])} / {human_bytes(r['total'])}")
+        s = d["swap"]
+        if s["total"]:
+            row(out, "Swap", f"{bar(s['percent'])} {s['percent']:5.1f}%  "
+                             f"{human_bytes(s['used'])} / {human_bytes(s['total'])}")
+        blocks.append(out)
 
-    lines.append("")
-    lines.append(p("Temperatures", "1;36"))
-    sockets = c["packages"] if len(c["packages"]) > 1 else [{"name": "CPU", "temp": c["temp"]}]
-    for i, s in enumerate(sockets):
-        model = "" if compact or i else p(f"  {c['model']}", "90")
-        lines.append(f"  {s['name']:<5}{temp(s['temp'], 70, th['cpu_temp'])}{model}")
-    if d["gpus"]:
-        for g in d["gpus"]:
-            extra = ""
-            if g["util"] is not None:
-                extra += f"  {g['util']:.0f}% busy"
-            if g["mem_total"]:
-                extra += f"  VRAM {human_bytes(g['mem_used'])} / {human_bytes(g['mem_total'])}"
-            if g.get("on_die"):
-                extra += p(" (CPU die)", "90")
-            name = "" if compact else p(f"  {g['name']}", "90")
-            lines.append(f"  {'GPU':<5}{temp(g['temp'], 70, th['gpu_temp'])}{extra}{name}")
-    else:
-        lines.append(f"  {'GPU':<5}{p('  none found', '90')}")
-    if d["ssds"]:
-        for sd in d["ssds"]:
-            name = "" if compact else p(f"  {sd['name']} ({sd['dev']})", "90")
-            lines.append(f"  {'SSD':<5}{temp(sd['temp'], 55, th['ssd_temp'])}{name}")
-    else:
-        lines.append(f"  {'SSD':<5}{p('  no sensor', '90')}")
-    for f in d["fans"]:
-        lines.append(f"  {'Fan':<5}{f['rpm']:5d} RPM")
+    if want("disk"):
+        out = []
+        for k in d["disks"]:
+            name = k["mount"] if len(k["mount"]) <= 14 else "…" + k["mount"][-13:]
+            usage = (f"{bar(k['percent'])} {k['percent']:5.1f}%  "
+                     f"{human_bytes(k['used'])} / {human_bytes(k['total'])}")
+            if compact:
+                row(out, "Disk", name)
+                row(out, "", usage)
+            else:
+                row(out, "Disk", f"{name:<14} {usage}")
+        blocks.append(out)
+
+    if want("temp"):
+        out = [p("Temperatures", "1;36")]
+        sockets = c["packages"] if len(c["packages"]) > 1 else [{"name": "CPU", "temp": c["temp"]}]
+        for i, s in enumerate(sockets):
+            model = "" if compact or i else p(f"  {c['model']}", "90")
+            out.append(f"  {s['name']:<5}{temp(s['temp'], 70, th['cpu_temp'])}{model}")
+        if d["gpus"]:
+            for g in d["gpus"]:
+                extra = ""
+                if g["util"] is not None:
+                    extra += f"  {g['util']:.0f}% busy"
+                if g["mem_total"]:
+                    extra += f"  VRAM {human_bytes(g['mem_used'])} / {human_bytes(g['mem_total'])}"
+                if g.get("on_die"):
+                    extra += p(" (CPU die)", "90")
+                name = "" if compact else p(f"  {g['name']}", "90")
+                out.append(f"  {'GPU':<5}{temp(g['temp'], 70, th['gpu_temp'])}{extra}{name}")
+        else:
+            out.append(f"  {'GPU':<5}{p('  none found', '90')}")
+        if d["ssds"]:
+            for sd in d["ssds"]:
+                name = "" if compact else p(f"  {sd['name']} ({sd['dev']})", "90")
+                out.append(f"  {'SSD':<5}{temp(sd['temp'], 55, th['ssd_temp'])}{name}")
+        else:
+            out.append(f"  {'SSD':<5}{p('  no sensor', '90')}")
+        for f in d["fans"]:
+            out.append(f"  {'Fan':<5}{f['rpm']:5d} RPM")
+        blocks.append(out)
 
     ip = d.get("ipmi")
-    if ip:
-        lines.append("")
+    if want("server") and ip:
+        out = []
         head = p("Server (IPMI)", "1;36")
         if d.get("machine") and not compact:
             head += p(f"  {d['machine']}", "90")
         if ip["age"] > IPMI_STALE_SECS:
             head += p(f"  data {human_duration(ip['age'])} old", "33")
-        lines.append(head)
+        out.append(head)
         if ip["inlet"] is not None:
-            lines.append(f"  {'Inlet':<8}{temp(ip['inlet'], th['inlet_temp'] - 5, th['inlet_temp'])}"
-                         + ("" if compact else p("  air in", "90")))
+            out.append(f"  {'Inlet':<8}{temp(ip['inlet'], th['inlet_temp'] - 5, th['inlet_temp'])}"
+                       + ("" if compact else p("  air in", "90")))
         if ip["exhaust"] is not None:
             rise = ""
             if ip["inlet"] is not None:
                 rise = p(f"  {ip['exhaust'] - ip['inlet']:+.0f}°C over inlet", "90")
-            lines.append(f"  {'Exhaust':<8}{temp(ip['exhaust'], th['exhaust_temp'] - 10, th['exhaust_temp'])}"
-                         + rise)
+            out.append(f"  {'Exhaust':<8}"
+                       f"{temp(ip['exhaust'], th['exhaust_temp'] - 10, th['exhaust_temp'])}{rise}")
         rpms = [f["rpm"] for f in ip["fans"] if f["rpm"] is not None]
         if rpms:
             if compact:
@@ -642,30 +658,34 @@ def render(d, color=True, bar_width=24, compact=False, th=None):
             red = ip["fan_redundancy"]
             if red and red != "Disabled" and not compact:
                 fans += " · " + (p(red, "32") if red == "Fully Redundant" else p(red, "31;1"))
-            lines.append(f"  {'Fans':<8}{fans}")
+            out.append(f"  {'Fans':<8}{fans}")
         if ip["power_w"] is not None:
-            lines.append(f"  {'Power':<8}{ip['power_w']:.0f} W")
+            out.append(f"  {'Power':<8}{ip['power_w']:.0f} W")
         for psu in ip["psus"]:
             ok = psu["state"] == "ok"
-            lines.append(f"  {psu['name']:<8}" + (p("ok", "32") if ok else p(psu["state"], "31;1")))
+            out.append(f"  {psu['name']:<8}" + (p("ok", "32") if ok else p(psu["state"], "31;1")))
+        blocks.append(out)
 
-    lines.append("")
-    b = d["battery"]
-    if b:
-        state = "charging" if b["plugged"] else "on battery"
-        left = f", {human_duration(b['secs_left'])} left" if b["secs_left"] and not b["plugged"] else ""
-        row("Batt", f"{b['percent']:.0f}% ({state}{left})")
-    row("Net", f"↑ {human_bytes(d['net']['sent'])}  ↓ {human_bytes(d['net']['recv'])}"
-               + p("  since boot", "90"))
+    if want("misc"):
+        out = []
+        b = d["battery"]
+        if b:
+            state = "charging" if b["plugged"] else "on battery"
+            left = (f", {human_duration(b['secs_left'])} left"
+                    if b["secs_left"] and not b["plugged"] else "")
+            row(out, "Batt", f"{b['percent']:.0f}% ({state}{left})")
+        row(out, "Net", f"↑ {human_bytes(d['net']['sent'])}  ↓ {human_bytes(d['net']['recv'])}"
+                        + p("  since boot", "90"))
+        blocks.append(out)
 
-    top = d["top"][: 3 if compact else 5]
-    if top:
-        lines.append("")
-        lines.append(p("Top processes", "1;36") + p("  (CPU% of whole system, MEM%)", "90"))
+    top = d["top"][: top_n or (3 if compact else 5)]
+    if want("top") and top:
+        out = [p("Top processes", "1;36") + p("  (CPU% of whole system, MEM%)", "90")]
         for t in top:
-            name = t["name"][:18]
-            lines.append(f"  {name:<18} {t['cpu']:5.1f}%  {t['mem']:5.1f}%")
-    return "\n".join(lines)
+            out.append(f"  {t['name'][:18]:<18} {t['cpu']:5.1f}%  {t['mem']:5.1f}%")
+        blocks.append(out)
+
+    return "\n\n".join("\n".join(b) for b in blocks if b)
 
 
 # ---------------------------------------------------------------- telegram
@@ -675,7 +695,8 @@ class TelegramError(Exception):
 
 
 def tg(token, method, params=None, timeout=20):
-    url = f"https://api.telegram.org/bot{token}/{method}"
+    url = f"{TELEGRAM_API}/bot{token}/{method}"
+    params = {k: v for k, v in (params or {}).items() if v is not None}
     data = urllib.parse.urlencode(params).encode() if params else None
     try:
         with urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=timeout) as r:
@@ -716,6 +737,119 @@ def send_report(cfg, retries=3, quiet=False):
             if attempt == retries or "network" not in str(e):
                 sys.exit(f"Telegram send failed: {e}")
             time.sleep(15)  # network may still be coming up after resume
+
+
+# --------------------------------------------------------------------- bot
+
+BOT_COMMANDS = [
+    ("status", "Full system report"),
+    ("temp", "CPU, GPU, SSD and server air temperatures"),
+    ("fans", "Fan speeds, power draw and power supplies"),
+    ("disk", "Disk usage"),
+    ("top", "Busiest processes, CPU and RAM"),
+    ("interval", "Show or change the report interval, e.g. /interval 30m"),
+    ("help", "List commands"),
+]
+
+
+def log(msg):
+    print(f"{datetime.now():%Y-%m-%d %H:%M:%S} {msg}", flush=True)
+
+
+def bot_help(host):
+    lines = [f"<b>🖥 {html.escape(host)} · sysmon commands</b>"]
+    lines += [f"/{c} – {html.escape(d)}" for c, d in BOT_COMMANDS]
+    return "\n".join(lines)
+
+
+def bot_reply(text):
+    """The HTML reply for one message sent to the bot."""
+    cfg = load_config()  # pick up changes made from the terminal meanwhile
+    th = cfg["thresholds"]
+    parts = text.split()
+    cmd = parts[0].split("@")[0].lstrip("/").lower() if parts else ""
+    arg = parts[1] if len(parts) > 1 else None
+    host = socket.gethostname()
+
+    def section(title, d, sections, **kw):
+        body = render(d, color=False, bar_width=10, compact=True, th=th, sections=sections, **kw)
+        return f"<b>🖥 {html.escape(d['host'])} · {title}</b>\n<pre>{html.escape(body)}</pre>"
+
+    if cmd == "status":
+        return telegram_message(collect(), th)
+    if cmd == "temp":
+        return section("temperatures", collect(), {"temp", "server"})
+    if cmd == "fans":
+        d = collect()
+        if d["ipmi"]:
+            return section("fans & power", d, {"server"})
+        if d["fans"]:
+            body = "\n".join(f"Fan  {f['rpm']} RPM" for f in d["fans"])
+            return f"<b>🖥 {html.escape(host)} · fans</b>\n<pre>{body}</pre>"
+        return (f"<b>🖥 {html.escape(host)}</b>\nNo fan sensors found. On a rack server, "
+                "run <code>sudo ./install-ipmi.sh</code> to read them from the BMC.")
+    if cmd == "disk":
+        return section("disks", collect(), {"disk"})
+    if cmd == "top":
+        return section("top processes", collect(top_n=10), {"usage", "top"}, top_n=10)
+    if cmd == "interval":
+        if arg:
+            try:
+                return html.escape(set_interval(cfg, arg))
+            except ValueError as e:
+                return f"⚠️ {html.escape(str(e))}"
+        state = "on" if timer_enabled() else "off"
+        return (f"Reports every <b>{html.escape(cfg['interval'])}</b> (schedule {state}).\n"
+                "Change with e.g. <code>/interval 30m</code>")
+    return bot_help(host)
+
+
+def bot_loop(cfg):
+    token, chat = cfg["bot_token"], str(cfg["chat_id"])
+    try:
+        tg(token, "setMyCommands", {"commands": json.dumps(
+            [{"command": c, "description": d} for c, d in BOT_COMMANDS])})
+    except TelegramError as e:
+        log(f"Couldn't register the command menu: {e}")
+    log(f"Listening for commands from chat {chat}.")
+    offset = None
+    while True:
+        try:
+            updates = tg(token, "getUpdates", {
+                "offset": offset, "timeout": 50,
+                "allowed_updates": json.dumps(["message"])}, timeout=65)
+        except TelegramError as e:
+            if "conflict" in str(e).lower():
+                log("Another program is reading this bot's messages. If another machine runs "
+                    "the sysmon bot with the same token, give each machine its own bot "
+                    "(@BotFather → /newbot).")
+                time.sleep(60)
+            else:
+                log(f"Telegram: {e}")
+                time.sleep(10)
+            continue
+        for u in updates:
+            offset = u["update_id"] + 1
+            msg = u.get("message") or {}
+            text = (msg.get("text") or "").strip()
+            sender = str(msg.get("chat", {}).get("id"))
+            if not text:
+                continue
+            if sender != chat:
+                log(f"Ignored a message from chat {sender} (only {chat} may use this bot).")
+                continue
+            if time.time() - msg.get("date", 0) > BOT_MAX_AGE_SECS:
+                log(f"Skipped an old command: {text}")
+                continue
+            log(f"Command: {text}")
+            try:
+                reply = bot_reply(text)
+            except (Exception, SystemExit) as e:  # never let one command stop the bot
+                reply = f"⚠️ {html.escape(str(e) or type(e).__name__)}"
+            try:
+                tg(token, "sendMessage", {"chat_id": chat, "text": reply, "parse_mode": "HTML"})
+            except TelegramError as e:
+                log(f"Couldn't reply: {e}")
 
 
 # ---------------------------------------------------------------- schedule
@@ -779,6 +913,44 @@ def remove_timer():
     systemctl("daemon-reload", check=False)
 
 
+def install_bot_service():
+    UNIT_DIR.mkdir(parents=True, exist_ok=True)
+    (UNIT_DIR / BOT_SERVICE_NAME).write_text(
+        "[Unit]\n"
+        "Description=sysmon Telegram bot commands\n\n"
+        "[Service]\n"
+        f"ExecStart={sys.executable} {Path(__file__).resolve()} bot run\n"
+        "Restart=always\n"
+        "RestartSec=15\n\n"
+        "[Install]\n"
+        "WantedBy=default.target\n")
+    systemctl("daemon-reload")
+    systemctl("enable", BOT_SERVICE_NAME)
+    systemctl("restart", BOT_SERVICE_NAME)
+
+
+def remove_bot_service():
+    systemctl("disable", "--now", BOT_SERVICE_NAME, check=False)
+    (UNIT_DIR / BOT_SERVICE_NAME).unlink(missing_ok=True)
+    systemctl("daemon-reload", check=False)
+
+
+def bot_active():
+    return systemctl("is-active", BOT_SERVICE_NAME, check=False).stdout.strip() == "active"
+
+
+def linger_note():
+    """User services stop at logout (e.g. closing SSH) unless lingering is on."""
+    if not shutil.which("loginctl"):
+        return
+    user = os.environ.get("USER") or Path.home().name
+    res = subprocess.run(["loginctl", "show-user", user, "--property=Linger", "--value"],
+                         capture_output=True, text=True)
+    if res.stdout.strip() == "no":
+        print("Note: reports and bot commands stop when you log out (e.g. close SSH).\n"
+              f"To keep them running:  sudo loginctl enable-linger {user}")
+
+
 def timer_enabled():
     return systemctl("is-enabled", TIMER_NAME, check=False).stdout.strip() == "enabled"
 
@@ -835,6 +1007,11 @@ def cmd_setup(args, cfg):
         sys.exit(f"That token didn't work: {e}")
     print(f"   OK, connected to @{me['username']}.\n")
 
+    # A running bot service would read (and use up) the message we're about to look for.
+    bot_was_on = bot_active()
+    if bot_was_on:
+        systemctl("stop", BOT_SERVICE_NAME, check=False)
+
     print(f"2. Open https://t.me/{me['username']} and send it any message (e.g. /start).")
     input("   Press Enter once you've sent it...")
     chat_id = None
@@ -871,6 +1048,15 @@ def cmd_setup(args, cfg):
     install_timer(cfg)
     print(f"Scheduled: a report every {cfg['interval']}. Next run: {next_run()}")
 
+    default = "Y/n"
+    answer = input(f"\n4. Answer commands sent to the bot (/status, /temp, /fans ...)? [{default}]: ")
+    if answer.strip().lower() in ("", "y", "yes"):
+        install_bot_service()
+        print("Bot commands on. Send /help to your bot to see them.")
+    elif bot_was_on:
+        remove_bot_service()
+    linger_note()
+
 
 def cmd_interval(args, cfg):
     if not args.value:
@@ -878,16 +1064,48 @@ def cmd_interval(args, cfg):
               f"{'' if timer_enabled() else ' (schedule is off)'}.")
         return
     try:
-        secs = parse_interval(args.value)
+        print(set_interval(cfg, args.value))
     except ValueError as e:
         sys.exit(str(e))
-    cfg["interval"] = format_interval(secs)
+
+
+def set_interval(cfg, value):
+    """Save a new interval and reschedule. Used by the terminal and the bot."""
+    cfg["interval"] = format_interval(parse_interval(value))
     save_config(cfg)
     if timer_enabled():
         install_timer(cfg)
-        print(f"Interval set to {cfg['interval']}. Next report: {next_run()}")
+        return f"Interval set to {cfg['interval']}. Next report: {next_run()}"
+    return f"Interval set to {cfg['interval']}. Reports are off; turn them on with: sysmon schedule on"
+
+
+def require_telegram(cfg):
+    if not cfg["bot_token"] or not cfg["chat_id"]:
+        sys.exit("Telegram isn't set up yet. Run:  sysmon setup")
+
+
+def cmd_bot(args, cfg):
+    if args.action == "run":
+        require_telegram(cfg)
+        if bot_active() and not os.environ.get("INVOCATION_ID"):
+            sys.exit("The bot is already running as a service. Stop it first:  sysmon bot off")
+        try:
+            bot_loop(cfg)
+        except KeyboardInterrupt:
+            print()
+    elif args.action == "on":
+        require_telegram(cfg)
+        install_bot_service()
+        print("Bot commands on. Send /help to your bot to see them.")
+        linger_note()
+    elif args.action == "off":
+        remove_bot_service()
+        print("Bot commands turned off.")
+    elif bot_active():
+        print("Bot commands are on: /status /temp /fans /disk /top /interval /help")
+        print(f"Logs: journalctl --user -u {BOT_SERVICE_NAME}")
     else:
-        print(f"Interval set to {cfg['interval']}. Turn reports on with:  sysmon schedule on")
+        print("Bot commands are off. Turn on with:  sysmon bot on")
 
 
 def cmd_schedule(args, cfg):
@@ -896,6 +1114,7 @@ def cmd_schedule(args, cfg):
             sys.exit("Telegram isn't set up yet. Run:  sysmon setup")
         install_timer(cfg)
         print(f"Reports on: every {cfg['interval']}. Next run: {next_run()}")
+        linger_note()
     elif args.action == "off":
         remove_timer()
         print("Scheduled reports turned off.")
@@ -918,6 +1137,7 @@ def cmd_config(args, cfg):
     print(f"Bot token:   {masked}")
     print(f"Chat id:     {cfg['chat_id'] or '(not set)'}")
     print(f"Interval:    {cfg['interval']}  ({'on' if timer_enabled() else 'off'})")
+    print(f"Bot:         {'on' if bot_active() else 'off'}")
     print("Thresholds:  " + ", ".join(f"{k}={v}" for k, v in cfg["thresholds"].items()))
 
 
@@ -937,12 +1157,15 @@ def main():
     i.add_argument("value", nargs="?")
     sc = sub.add_parser("schedule", help="turn scheduled reports on/off or show status")
     sc.add_argument("action", choices=["on", "off", "status"], nargs="?", default="status")
+    b = sub.add_parser("bot", help="answer Telegram commands like /status (on/off/status/run)")
+    b.add_argument("action", choices=["on", "off", "status", "run"], nargs="?", default="status")
     sub.add_parser("config", help="show current settings")
 
     args = ap.parse_args()
     cfg = load_config()
     handlers = {"show": cmd_show, "watch": cmd_watch, "setup": cmd_setup, "send": cmd_send,
-                "interval": cmd_interval, "schedule": cmd_schedule, "config": cmd_config}
+                "interval": cmd_interval, "schedule": cmd_schedule, "bot": cmd_bot,
+                "config": cmd_config}
     if args.cmd is None:
         args.cmd, args.json = "show", False
     if args.cmd == "watch" and args.n <= 0:
